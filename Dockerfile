@@ -1,26 +1,20 @@
-{% extends "base.html" %}
-{% block title %}Book Ticket - TravelTix{% endblock %}
-{% block content %}
-<h2>Book: {{ route['source'] }} → {{ route['destination'] }}</h2>
-<p class="muted">{{ route['operator'] }} · {{ route['mode']|capitalize }} · Departs {{ route['departure_time'] }} · {{ route['distance_km'] }} km</p>
+# TravelTix - combined Python + Java single-service image
+# Deployed by: Saikrishnan S
+FROM eclipse-temurin:21-jdk-jammy
 
-<form class="booking-form" method="post">
-  <div class="field">
-    <label>Full Name</label>
-    <input type="text" name="name" required>
-  </div>
-  <div class="field">
-    <label>Email</label>
-    <input type="email" name="email" required>
-  </div>
-  <div class="field">
-    <label>Phone</label>
-    <input type="tel" name="phone" required>
-  </div>
-  <div class="field">
-    <label>Seats</label>
-    <input type="number" name="seats" min="1" max="{{ route['seats_available'] }}" value="1" required>
-  </div>
-  <button type="submit">Confirm Booking</button>
-</form>
-{% endblock %}
+# Install Python
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip python3-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app
+
+RUN chmod +x start.sh
+RUN pip3 install --no-cache-dir -r python-backend/requirements.txt
+
+# Render/Railway inject $PORT for the public-facing process (the Python site)
+ENV PORT=5000
+EXPOSE 5000
+
+CMD ["./start.sh"]
