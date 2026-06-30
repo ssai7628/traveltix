@@ -1,0 +1,227 @@
+"""
+TravelTix - Bus/Train Ticket Booking Website
+Owner / Deployed by: Saikrishnan S
+Backend: Python (Flask) + Java microservice (fare & ticket-ID generation)
+"""
+import os
+import sqlite3
+import uuid
+from datetime import datetime
+
+import requests
+from flask import Flask, render_template, request, redirect, url_for, flash, session
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "tickets.db")
+JAVA_SERVICE_URL = os.environ.get("JAVA_SERVICE_URL", "http://localhost:8080")
+SITE_OWNER = "Saikrishnan S"
+
+
+# ---------------------------------------------------------------- DATABASE --
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL,             -- 'bus' or 'train'
+            operator TEXT NOT NULL,
+            source TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            departure_time TEXT NOT NULL,
+            arrival_time TEXT NOT NULL,
+            distance_km INTEGER NOT NULL,
+            seats_available INTEGER NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id TEXT UNIQUE NOT NULL,
+            route_id INTEGER NOT NULL,
+            passenger_name TEXT NOT NULL,
+            passenger_email TEXT NOT NULL,
+            passenger_phone TEXT NOT NULL,
+            seats INTEGER NOT NULL,
+            fare REAL NOT NULL,
+            booked_at TEXT NOT NULL,
+            FOREIGN KEY (route_id) REFERENCES routes (id)
+        )
+    """)
+    conn.commit()
+
+    # seed sample routes only if empty
+    cur.execute("SELECT COUNT(*) AS c FROM routes")
+    if cur.fetchone()["c"] == 0:
+        sample = [
+            ("bus", "Saikrishnan Travels", "Chennai", "Bengaluru", "22:00", "05:30", 350, 40),
+            ("bus", "Saikrishnan Travels", "Chennai", "Madurai", "21:30", "04:00", 460, 35),
+            ("bus", "City Express", "Bengaluru", "Hyderabad", "20:00", "07:00", 570, 30),
+            ("train", "Southern Railways", "Chennai", "Coimbatore", "06:00", "13:30", 500, 80),
+            ("train", "Southern Railways", "Chennai", "Bengaluru", "23:00", "06:30", 360, 100),
+            ("train", "Southern Railways", "Bengaluru", "Mumbai", "14:00", "10:00", 980, 120),
+        ]
+        cur.executemany(
+            "INSERT INTO routes (mode, operator, source, destination, departure_time, "
+            "arrival_time, distance_km, seats_available) VALUES (?,?,?,?,?,?,?,?)",
+            sample,
+        )
+        conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------------- JAVA CLIENT --
+def call_java_fare_service(distance_km: int, mode: str, seats: int):
+    """
+    Calls the Java microservice to calculate fare and generate a ticket ID.
+    Falls back to a local calculation if the Java service is unreachable,
+    so the site keeps working even if that service is down.
+    """
+    try:
+        resp = requests.post(
+            f"{JAVA_SERVICE_URL}/api/fare",
+            json={"distanceKm": distance_km, "mode": mode, "seats": seats},
+            timeout=3,
+        )
+        if resp.ok:
+            data = resp.json()
+            return data["fare"], data["ticketId"]
+    except requests.exceptions.RequestException:
+        pass
+
+    # Fallback (local) calculation, mirrors the Java service logic
+    rate = 2.5 if mode == "bus" else 1.8
+    fare = round(distance_km * rate * seats, 2)
+    ticket_id = f"TT-{uuid.uuid4().hex[:8].upper()}"
+    return fare, ticket_id
+
+
+# ------------------------------------------------------------------ ROUTES --
+@app.route("/")
+def home():
+    return render_template("index.html", owner=SITE_OWNER)
+
+
+@app.route("/search")
+def search():
+    mode = request.args.get("mode", "")
+    source = request.args.get("source", "").strip()
+    destination = request.args.get("destination", "").strip()
+
+    conn = get_db()
+    query = "SELECT * FROM routes WHERE 1=1"
+    params = []
+    if mode:
+        query += " AND mode = ?"
+        params.append(mode)
+    if source:
+        query += " AND source LIKE ?"
+        params.append(f"%{source}%")
+    if destination:
+        query += " AND destination LIKE ?"
+        params.append(f"%{destination}%")
+    routes = conn.execute(query, params).fetchall()
+    conn.close()
+
+    return render_template(
+        "results.html", routes=routes, owner=SITE_OWNER,
+        mode=mode, source=source, destination=destination
+    )
+
+
+@app.route("/book/<int:route_id>", methods=["GET", "POST"])
+def book(route_id):
+    conn = get_db()
+    route = conn.execute("SELECT * FROM routes WHERE id = ?", (route_id,)).fetchone()
+    if route is None:
+        conn.close()
+        flash("Route not found.")
+        return redirect(url_for("home"))
+
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip()
+        phone = request.form.get("phone", "").strip()
+        seats = int(request.form.get("seats", 1))
+
+        if not name or not email or not phone or seats < 1:
+            flash("Please fill all fields correctly.")
+            conn.close()
+            return redirect(url_for("book", route_id=route_id))
+
+        if seats > route["seats_available"]:
+            flash("Not enough seats available.")
+            conn.close()
+            return redirect(url_for("book", route_id=route_id))
+
+        fare, ticket_id = call_java_fare_service(route["distance_km"], route["mode"], seats)
+
+        conn.execute(
+            "INSERT INTO bookings (ticket_id, route_id, passenger_name, passenger_email, "
+            "passenger_phone, seats, fare, booked_at) VALUES (?,?,?,?,?,?,?,?)",
+            (ticket_id, route_id, name, email, phone, seats, fare,
+             datetime.utcnow().isoformat()),
+        )
+        conn.execute(
+            "UPDATE routes SET seats_available = seats_available - ? WHERE id = ?",
+            (seats, route_id),
+        )
+        conn.commit()
+        conn.close()
+        return redirect(url_for("confirmation", ticket_id=ticket_id))
+
+    conn.close()
+    return render_template("book.html", route=route, owner=SITE_OWNER)
+
+
+@app.route("/confirmation/<ticket_id>")
+def confirmation(ticket_id):
+    conn = get_db()
+    booking = conn.execute(
+        "SELECT b.*, r.mode, r.operator, r.source, r.destination, r.departure_time, "
+        "r.arrival_time FROM bookings b JOIN routes r ON b.route_id = r.id "
+        "WHERE b.ticket_id = ?",
+        (ticket_id,),
+    ).fetchone()
+    conn.close()
+    if booking is None:
+        flash("Ticket not found.")
+        return redirect(url_for("home"))
+    return render_template("confirmation.html", booking=booking, owner=SITE_OWNER)
+
+
+@app.route("/my-tickets", methods=["GET", "POST"])
+def my_tickets():
+    bookings = []
+    email = ""
+    if request.method == "POST":
+        email = request.form.get("email", "").strip()
+        conn = get_db()
+        bookings = conn.execute(
+            "SELECT b.*, r.mode, r.operator, r.source, r.destination, r.departure_time "
+            "FROM bookings b JOIN routes r ON b.route_id = r.id "
+            "WHERE b.passenger_email = ? ORDER BY b.booked_at DESC",
+            (email,),
+        ).fetchall()
+        conn.close()
+    return render_template("my_tickets.html", bookings=bookings, email=email, owner=SITE_OWNER)
+
+
+@app.route("/health")
+def health():
+    return {"status": "ok", "service": "python-backend"}
+
+
+init_db()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
